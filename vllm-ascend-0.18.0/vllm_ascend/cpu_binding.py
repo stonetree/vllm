@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import ctypes
 import os
 import platform
 import shutil
@@ -517,3 +518,48 @@ def bind_cpus(rank_id: int) -> None:
         return
     binder = CpuAlloc(rank_id)
     binder.run_all()
+     # Apply NUMA memory binding for NPU's local node.
+    _bind_process_memory(binder)
+
+
+def _bind_process_memory(binder: "CpuAlloc") -> None:
+    """Bind process memory to the NUMA node of the assigned NPU.
+
+    Uses Linux mbind(MPOL_BIND + MPOL_MF_STRICT) to set the memory policy
+    for the process and migrate existing pages. This ensures that CPU-side
+    buffers used for H2D/N2D transfers are allocated from local NUMA memory,
+    avoiding cross-node bandwidth penalties on multi-socket Kunpeng servers.
+    """
+    if binder.assigned_numa_node < 0:
+        return
+
+    SYS_mbind = 237  # aarch64 Linux syscall
+    MPOL_BIND = 2
+    MPOL_MF_STRICT = 1 << 0
+
+    numa_node = binder.assigned_numa_node
+    nodemask = 1 << numa_node
+    maxnode = numa_node + 2
+
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    ret = libc.mbind(
+        ctypes.c_void_p(0),
+        ctypes.c_ulong(0),
+        MPOL_BIND,
+        ctypes.c_ulong(nodemask),
+        ctypes.c_ulong(maxnode),
+        MPOL_MF_STRICT,
+    )
+    if ret != 0:
+        logger.warning(
+            "mbind failed with errno=%d for NUMA node %d. "
+            "Falling back to migratepages only.",
+            ctypes.get_errno(),
+            numa_node,
+        )
+        return
+
+    logger.info(
+        "Worker memory bound to NUMA node %d (NPU assigned node).",
+        numa_node,
+    )
