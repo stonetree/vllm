@@ -1786,15 +1786,12 @@ class GPUModelRunner(
         # Note: pad query_start_loc to be non-decreasing, as kernels
         # like FlashAttention requires that
         self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
-        self.query_start_loc.copy_to_gpu()
-        query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
 
         self.seq_lens.np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
         )
         # Fill unused with 0 for full cuda graph mode.
         self.seq_lens.np[num_reqs:].fill(0)
-        self.seq_lens.copy_to_gpu()
 
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
@@ -1804,7 +1801,6 @@ class GPUModelRunner(
         self.discard_request_mask.np[:num_reqs] = (
             self.seq_lens.np[:num_reqs] < num_tokens_np
         )
-        self.discard_request_mask.copy_to_gpu(num_reqs)
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -1812,6 +1808,15 @@ class GPUModelRunner(
             total_num_scheduled_tokens,
             cu_num_tokens,
         )
+
+        # Batch all remaining H2D copies to maximize DMA parallelism.
+        # Deferred from above: query_start_loc, seq_lens, discard_request_mask.
+        self.query_start_loc.copy_to_gpu()
+        self.seq_lens.copy_to_gpu()
+        self.discard_request_mask.copy_to_gpu(num_reqs)
+
+        # Access GPU results after all async copies are issued.
+        query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
 
         if self.uses_mrope:
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
