@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import ctypes
+import ctypes.util
 import os
 import platform
 import shutil
@@ -516,57 +517,81 @@ def bind_cpus(rank_id: int) -> None:
     if not is_arm_cpu():
         logger.info("CPU binding skipped: non-ARM CPU detected.")
         return
-    
+
     # Set OpenMP affinity and wait policy for ARM platforms (libgomp/libomp).
     # Prevents threads from drifting across NUMA nodes and reduces wake-up latency.
-    os.environ["OMP_PROC_BIND"] = "true"
-    os.environ["OMP_PLACES"] = "cores"
-    os.environ["OMP_WAIT_POLICY"] = "active"
+    os.environ.setdefault("OMP_PROC_BIND", "true")
+    os.environ.setdefault("OMP_PLACES", "cores")
+    os.environ.setdefault("OMP_WAIT_POLICY", "active")
 
     binder = CpuAlloc(rank_id)
     binder.run_all()
-     # Apply NUMA memory binding for NPU's local node.
+    # Apply NUMA memory binding for NPU's local node.
     _bind_process_memory(binder)
 
 
 def _bind_process_memory(binder: "CpuAlloc") -> None:
     """Bind process memory to the NUMA node of the assigned NPU.
 
-    Uses Linux mbind(MPOL_BIND + MPOL_MF_STRICT) to set the memory policy
-    for the process and migrate existing pages. This ensures that CPU-side
-    buffers used for H2D/N2D transfers are allocated from local NUMA memory,
-    avoiding cross-node bandwidth penalties on multi-socket Kunpeng servers.
+    Uses libnuma to set the memory policy for future process allocations.
+    Existing pages are still handled by CpuAlloc.bind_memory() via migratepages.
     """
-    if binder.assigned_numa_node < 0:
+    numa_node = _get_assigned_numa_node(binder)
+    if numa_node is None:
         return
 
-    SYS_mbind = 237  # aarch64 Linux syscall
-    MPOL_BIND = 2
-    MPOL_MF_STRICT = 1 << 0
-
-    numa_node = binder.assigned_numa_node
-    nodemask = 1 << numa_node
-    maxnode = numa_node + 2
-
-    libc = ctypes.CDLL("libc.so.6", use_errno=True)
-    ret = libc.mbind(
-        ctypes.c_void_p(0),
-        ctypes.c_ulong(0),
-        MPOL_BIND,
-        ctypes.c_ulong(nodemask),
-        ctypes.c_ulong(maxnode),
-        MPOL_MF_STRICT,
-    )
-    if ret != 0:
-        logger.warning(
-            "mbind failed with errno=%d for NUMA node %d. "
-            "Falling back to migratepages only.",
-            ctypes.get_errno(),
-            numa_node,
-        )
+    if not _set_process_membind(numa_node):
         return
 
     logger.info(
         "Worker memory bound to NUMA node %d (NPU assigned node).",
         numa_node,
     )
+
+
+def _get_assigned_numa_node(binder: "CpuAlloc") -> int | None:
+    running_npus = binder.device_info.running_npu_list
+    if binder.rank_id < 0 or binder.rank_id >= len(running_npus):
+        logger.warning("Rank %d has no matching NPU for memory binding.", binder.rank_id)
+        return None
+
+    current_npu = running_npus[binder.rank_id]
+    cpu_pool = binder.npu_cpu_pool.get(current_npu, [])
+    if not cpu_pool:
+        logger.warning("NPU %d has no CPU pool for memory binding.", current_npu)
+        return None
+
+    return binder.cpu_node.get(cpu_pool[0])
+
+
+def _set_process_membind(numa_node: int) -> bool:
+    libnuma_path = ctypes.util.find_library("numa")
+    if not libnuma_path:
+        logger.warning("libnuma is unavailable; falling back to migratepages only.")
+        return False
+
+    try:
+        libnuma = ctypes.CDLL(libnuma_path, use_errno=True)
+        libnuma.numa_available.restype = ctypes.c_int
+        if libnuma.numa_available() < 0:
+            return False
+
+        libnuma.numa_parse_nodestring.argtypes = [ctypes.c_char_p]
+        libnuma.numa_parse_nodestring.restype = ctypes.c_void_p
+        nodemask = libnuma.numa_parse_nodestring(str(numa_node).encode())
+        if not nodemask:
+            logger.warning("Failed to parse NUMA node %d for memory binding.", numa_node)
+            return False
+
+        libnuma.numa_set_membind.argtypes = [ctypes.c_void_p]
+        libnuma.numa_set_membind(nodemask)
+        if hasattr(libnuma, "numa_free_nodemask"):
+            libnuma.numa_free_nodemask.argtypes = [ctypes.c_void_p]
+            libnuma.numa_free_nodemask(nodemask)
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Failed to set NUMA memory policy: %s. Falling back to migratepages only.",
+            exc,
+        )
+        return False

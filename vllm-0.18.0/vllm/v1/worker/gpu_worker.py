@@ -3,6 +3,7 @@
 """A GPU worker class."""
 
 import ctypes
+import ctypes.util
 import gc
 import os
 import sys
@@ -334,35 +335,14 @@ class Worker(WorkerBase):
             return
 
         try:
-            gpu_numa_node = self._get_gpu_numa_node()
+            gpu_numa_node = self._get_gpu_numa_node(self.local_rank)
         except Exception:
             return
 
         if gpu_numa_node < 0:
             return
 
-        SYS_mbind = 237  # aarch64/x86_64 Linux syscall number
-        MPOL_BIND = 2
-        MPOL_MF_STRICT = 1 << 0
-
-        nodemask = 1 << gpu_numa_node
-        maxnode = gpu_numa_node + 2
-
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        ret = libc.mbind(
-            ctypes.c_void_p(0),
-            ctypes.c_ulong(0),
-            MPOL_BIND,
-            ctypes.c_ulong(nodemask),
-            ctypes.c_ulong(maxnode),
-            MPOL_MF_STRICT,
-        )
-        if ret != 0:
-            logger.warning(
-                "mbind failed with errno=%d for NUMA node %d",
-                ctypes.get_errno(),
-                gpu_numa_node,
-            )
+        if not self._set_process_membind(gpu_numa_node):
             return
 
         logger.info(
@@ -373,14 +353,46 @@ class Worker(WorkerBase):
         )
 
     @staticmethod
-    def _get_gpu_numa_node() -> int:
+    def _set_process_membind(numa_node: int) -> bool:
+        """Set future process allocations to prefer the given NUMA node."""
+        libnuma_path = ctypes.util.find_library("numa")
+        if not libnuma_path:
+            logger.warning("libnuma is unavailable; skipping GPU NUMA memory binding.")
+            return False
+
+        try:
+            libnuma = ctypes.CDLL(libnuma_path, use_errno=True)
+            libnuma.numa_available.restype = ctypes.c_int
+            if libnuma.numa_available() < 0:
+                return False
+
+            libnuma.numa_parse_nodestring.argtypes = [ctypes.c_char_p]
+            libnuma.numa_parse_nodestring.restype = ctypes.c_void_p
+            nodemask = libnuma.numa_parse_nodestring(str(numa_node).encode())
+            if not nodemask:
+                logger.warning("Failed to parse NUMA node %d for GPU memory binding.", numa_node)
+                return False
+
+            libnuma.numa_set_membind.argtypes = [ctypes.c_void_p]
+            libnuma.numa_set_membind(nodemask)
+            if hasattr(libnuma, "numa_free_nodemask"):
+                libnuma.numa_free_nodemask.argtypes = [ctypes.c_void_p]
+                libnuma.numa_free_nodemask(nodemask)
+            return True
+        except Exception as exc:
+            logger.warning("Failed to set GPU NUMA memory policy: %s", exc)
+            return False
+
+    @staticmethod
+    def _get_gpu_numa_node(local_rank: int) -> int:
         """Discover the NUMA node of the GPU at local_rank via nvml or sysfs."""
         # Try nvml first
         try:
             import pynvml
 
             pynvml.nvmlInit()
-            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            physical_device_id = current_platform.device_id_to_physical_device_id(local_rank)
+            handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
             pci_info = pynvml.nvmlDeviceGetPciInfo(handle)
             pci_bus_id = pci_info.busId
         except Exception:

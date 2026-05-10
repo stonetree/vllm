@@ -501,12 +501,6 @@ class FlashTree:
 
         return final_deployment, deployed_replicas, final_par
 
-
-import ...existing imports...
-import time
-
-...
-
 class FlashLB(EplbPolicy):
     """
     Flash Load Balancing (FlashLB) policy for expert deployment optimization
@@ -554,9 +548,11 @@ class FlashLB(EplbPolicy):
 
         # Expert assignment cache for reducing recomputation under stable load.
         self._last_recompute_time: float = 0.0
-        self._min_recompute_interval: float = 1.0  # seconds
-        self._cached_deployment: dict[int, np.ndarray] = {}
-        self._cached_replicas: dict[int, np.ndarray] = {}
+        self._min_recompute_interval: float = (
+            config.min_recompute_interval
+            if hasattr(config, "min_recompute_interval")
+            else 1.0
+        )  # seconds
 
     def min_max_replica(
         self, mu: np.ndarray, var: np.ndarray, num_available_replicas: int, current_replicas: np.ndarray, z_score: float
