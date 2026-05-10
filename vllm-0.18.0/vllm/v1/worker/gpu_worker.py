@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A GPU worker class."""
 
+import ctypes
 import gc
 import os
+import sys
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from datetime import timedelta
@@ -254,6 +256,9 @@ class Worker(WorkerBase):
             self.device = torch.device(f"cuda:{self.local_rank}")
             torch.accelerator.set_device_index(self.device)
 
+            # Bind process memory to GPU's NUMA node for optimal H2D DMA.
+            self._bind_memory_to_gpu_numa()
+
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
             # Initialize the distributed environment BEFORE taking
@@ -312,6 +317,82 @@ class Worker(WorkerBase):
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+
+    def _bind_memory_to_gpu_numa(self) -> None:
+        """Bind process memory to the NUMA node of its assigned GPU.
+
+        On multi-NUMA systems (common on Kunpeng ARM servers), the GPU is
+        attached to a specific NUMA node via PCIe. Binding process memory
+        to that node ensures H2D DMA transfers use local memory bandwidth
+        and avoids cross-NUMA penalties.
+
+        Uses the Linux mbind() syscall (MPOL_BIND + MPOL_MF_STRICT) which
+        both sets the memory policy for future allocations and migrates
+        existing pages. Silently skips on non-Linux or non-NUMA systems.
+        """
+        if not sys.platform.startswith("linux"):
+            return
+
+        try:
+            gpu_numa_node = self._get_gpu_numa_node()
+        except Exception:
+            return
+
+        if gpu_numa_node < 0:
+            return
+
+        SYS_mbind = 237  # aarch64/x86_64 Linux syscall number
+        MPOL_BIND = 2
+        MPOL_MF_STRICT = 1 << 0
+
+        nodemask = 1 << gpu_numa_node
+        maxnode = gpu_numa_node + 2
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        ret = libc.mbind(
+            ctypes.c_void_p(0),
+            ctypes.c_ulong(0),
+            MPOL_BIND,
+            ctypes.c_ulong(nodemask),
+            ctypes.c_ulong(maxnode),
+            MPOL_MF_STRICT,
+        )
+        if ret != 0:
+            logger.warning(
+                "mbind failed with errno=%d for NUMA node %d",
+                ctypes.get_errno(),
+                gpu_numa_node,
+            )
+            return
+
+        logger.info(
+            "Worker rank %d (GPU %d): memory bound to NUMA node %d",
+            self.rank,
+            self.local_rank,
+            gpu_numa_node,
+        )
+
+    @staticmethod
+    def _get_gpu_numa_node() -> int:
+        """Discover the NUMA node of the GPU at local_rank via nvml or sysfs."""
+        # Try nvml first
+        try:
+            import pynvml
+
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            pci_info = pynvml.nvmlDeviceGetPciInfo(handle)
+            pci_bus_id = pci_info.busId
+        except Exception:
+            # Fallback: scan /sys/bus/pci/devices for first GPU-like device
+            return -1
+
+        numa_node_path = f"/sys/bus/pci/devices/{pci_bus_id}/numa_node"
+        try:
+            with open(numa_node_path) as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return -1
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
