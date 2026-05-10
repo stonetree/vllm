@@ -52,12 +52,15 @@ class CpuNpuOffloadingHandler(OffloadingHandler):
         assert cpu_block_size % gpu_block_size == 0
         self.block_size_factor = cpu_block_size // gpu_block_size
 
-        # npu streams for npu->cpu and cpu->npu
-        self.d2h_stream = torch.npu.Stream()
-        self.h2d_stream = torch.npu.Stream()
+        # npu streams for npu->cpu and cpu->npu.
+        # K and V use independent streams for parallel DMA transfers.
+        self.d2h_stream_k = torch.npu.Stream()
+        self.d2h_stream_v = torch.npu.Stream()
+        self.h2d_stream_k = torch.npu.Stream()
+        self.h2d_stream_v = torch.npu.Stream()
 
-        # job_id -> transfer npu event
-        self.transfer_events: dict[int, torch.npu.Event] = {}
+        # job_id -> (k_event, v_event) transfer npu events
+        self.transfer_events: dict[int, tuple[torch.npu.Event, torch.npu.Event | None]] = {}
         # list of npu events available for reuse
         self.events_pool: list[torch.npu.Event] = []
 
@@ -99,7 +102,8 @@ class CpuNpuOffloadingHandler(OffloadingHandler):
         src_spec, dst_spec = spec
         if isinstance(src_spec, CPULoadStoreSpec):
             assert isinstance(dst_spec, GPULoadStoreSpec)
-            stream = self.h2d_stream
+            stream_k = self.h2d_stream_k
+            stream_v = self.h2d_stream_v
             src_tensors = self.cpu_tensors
             dst_tensors = self.npu_tensors
             src_block_size_factor = self.block_size_factor
@@ -107,7 +111,8 @@ class CpuNpuOffloadingHandler(OffloadingHandler):
         else:
             assert isinstance(src_spec, GPULoadStoreSpec)
             assert isinstance(dst_spec, CPULoadStoreSpec)
-            stream = self.d2h_stream
+            stream_k = self.d2h_stream_k
+            stream_v = self.d2h_stream_v
             src_tensors = self.npu_tensors
             dst_tensors = self.cpu_tensors
             src_block_size_factor = 1
@@ -133,18 +138,25 @@ class CpuNpuOffloadingHandler(OffloadingHandler):
         )
         src_to_dst_tensor = torch.from_numpy(src_to_dst)
 
-        event = self.events_pool.pop() if self.events_pool else torch.npu.Event()
-        with torch.npu.stream(stream):
+        # Allocate events for K and V parallel streams.
+        event_k = self.events_pool.pop() if self.events_pool else torch.npu.Event()
+        event_v = self.events_pool.pop() if self.events_pool else torch.npu.Event()
+
+        # K transfers on stream_k
+        with torch.npu.stream(stream_k):
             for src_tensor, dst_tensor in zip(src_tensors, dst_tensors):
-                src_key_cache, src_value_cache = src_tensor[0], src_tensor[1]
-                dst_key_cache, dst_value_cache = dst_tensor[0], dst_tensor[1]
+                torch.ops._C_ascend.swap_blocks(
+                    src_tensor[0], dst_tensor[0], src_to_dst_tensor)
+            event_k.record(stream_k)
 
-                torch.ops._C_ascend.swap_blocks(src_key_cache, dst_key_cache, src_to_dst_tensor)
-                torch.ops._C_ascend.swap_blocks(src_value_cache, dst_value_cache, src_to_dst_tensor)
+        # V transfers on stream_v (parallel with K)
+        with torch.npu.stream(stream_v):
+            for src_tensor, dst_tensor in zip(src_tensors, dst_tensors):
+                torch.ops._C_ascend.swap_blocks(
+                    src_tensor[1], dst_tensor[1], src_to_dst_tensor)
+            event_v.record(stream_v)
 
-            event.record(stream)
-
-        self.transfer_events[job_id] = event
+        self.transfer_events[job_id] = (event_k, event_v)
 
         # success
         return True
@@ -152,8 +164,8 @@ class CpuNpuOffloadingHandler(OffloadingHandler):
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
         finished_job_ids = []
-        for job_id, event in self.transfer_events.items():
-            if event.query():
+        for job_id, (event_k, event_v) in self.transfer_events.items():
+            if event_k.query() and (event_v is None or event_v.query()):
                 results.append(
                     TransferResult(
                         job_id=job_id,
@@ -164,7 +176,9 @@ class CpuNpuOffloadingHandler(OffloadingHandler):
                     )
                 )
                 finished_job_ids.append(job_id)
-                self.events_pool.append(event)
+                self.events_pool.append(event_k)
+                if event_v is not None:
+                    self.events_pool.append(event_v)
         for job_id in finished_job_ids:
             del self.transfer_events[job_id]
         return results
@@ -174,7 +188,9 @@ class CpuNpuOffloadingHandler(OffloadingHandler):
         Wait (block) until all specified transfer jobs are completed.
         """
         for job_id in job_ids:
-            event = self.transfer_events.get(job_id)
-            if event is not None:
-                # This will block until the NPU event is complete
-                event.synchronize()
+            entry = self.transfer_events.get(job_id)
+            if entry is not None:
+                event_k, event_v = entry
+                event_k.synchronize()
+                if event_v is not None:
+                    event_v.synchronize()
