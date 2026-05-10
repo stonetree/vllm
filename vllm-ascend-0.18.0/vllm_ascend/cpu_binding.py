@@ -516,6 +516,13 @@ def bind_cpus(rank_id: int) -> None:
     if not is_arm_cpu():
         logger.info("CPU binding skipped: non-ARM CPU detected.")
         return
+    
+    # Set OpenMP affinity and wait policy for ARM platforms (libgomp/libomp).
+    # Prevents threads from drifting across NUMA nodes and reduces wake-up latency.
+    os.environ["OMP_PROC_BIND"] = "true"
+    os.environ["OMP_PLACES"] = "cores"
+    os.environ["OMP_WAIT_POLICY"] = "active"
+
     binder = CpuAlloc(rank_id)
     binder.run_all()
      # Apply NUMA memory binding for NPU's local node.

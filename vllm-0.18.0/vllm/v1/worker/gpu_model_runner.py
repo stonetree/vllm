@@ -434,6 +434,9 @@ class GPUModelRunner(
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
 
+        # Pre-allocate metadata buffers to avoid per-step allocation on host.
+        self.num_tokens_np_cache = np.empty(self.max_num_reqs, dtype=np.int32)
+
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
         # TODO: Support overlapping micro-batches
@@ -1793,8 +1796,12 @@ class GPUModelRunner(
         # Fill unused with 0 for full cuda graph mode.
         self.seq_lens.np[num_reqs:].fill(0)
 
-        num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
-        num_tokens_np = np.array(num_tokens, dtype=np.int32)
+        # Reuse pre-allocated buffer for request token counts.
+        # Direct NumPy-to-NumPy copy is faster than list comprehension on Kunpeng.
+        self.num_tokens_np_cache[:num_reqs] = (
+            self.input_batch.num_tokens_no_spec[:num_reqs]
+        )
+        num_tokens_np = self.num_tokens_np_cache[:num_reqs]
 
         # Record which requests should not be sampled,
         # so that we could clear the sampled tokens before returning

@@ -65,7 +65,15 @@ class CPUWorker(Worker):
                 )
 
         if sys.platform.startswith("linux"):
-            check_preloaded_libs("libtcmalloc")
+            ld_preload = os.environ.get("LD_PRELOAD", "")
+            if "libtcmalloc" not in ld_preload and "libjemalloc" not in ld_preload:
+                raise RuntimeError(
+                    "Neither libtcmalloc nor libjemalloc is found in LD_PRELOAD. "
+                    "One of them is required for optimal performance on Linux. "
+                    "Please follow the section `set LD_PRELOAD` in "
+                    "https://docs.vllm.ai/en/latest/getting_started/installation/cpu/ "
+                    "to setup required pre-loaded libraries."
+                )
             if current_platform.get_cpu_architecture() == CpuArchEnum.X86:
                 check_preloaded_libs("libiomp")
 
