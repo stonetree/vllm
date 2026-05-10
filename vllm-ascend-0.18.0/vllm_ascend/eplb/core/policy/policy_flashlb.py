@@ -3,6 +3,7 @@
 
 import logging
 import math
+import time
 from typing import Any
 
 import numpy as np
@@ -501,6 +502,11 @@ class FlashTree:
         return final_deployment, deployed_replicas, final_par
 
 
+import ...existing imports...
+import time
+
+...
+
 class FlashLB(EplbPolicy):
     """
     Flash Load Balancing (FlashLB) policy for expert deployment optimization
@@ -545,6 +551,12 @@ class FlashLB(EplbPolicy):
         self.hotness_window: dict[int, dict[str, Any]] = {}  # Layer-wise hotness stats and buffer
         self.current_deployment: dict[int, np.ndarray] = {}  # Current expert deployment per layer
         self.current_deployed_replicas: dict[int, np.ndarray] = {}  # Current replica count per expert per layer
+
+        # Expert assignment cache for reducing recomputation under stable load.
+        self._last_recompute_time: float = 0.0
+        self._min_recompute_interval: float = 1.0  # seconds
+        self._cached_deployment: dict[int, np.ndarray] = {}
+        self._cached_replicas: dict[int, np.ndarray] = {}
 
     def min_max_replica(
         self, mu: np.ndarray, var: np.ndarray, num_available_replicas: int, current_replicas: np.ndarray, z_score: float
@@ -894,9 +906,13 @@ class FlashLB(EplbPolicy):
         pars = np.zeros((num_layers,), dtype=np.float32)
 
         # Optimize each layer
+        now = time.time()
+        should_debounce = now - self._last_recompute_time < self._min_recompute_interval
+        recomputed = False
+
         for layer in range(num_layers):
-            if not self.need_update(layer):
-                # Keep current deployment if no update needed
+            if should_debounce or not self.need_update(layer):
+                # Keep current deployment if within debounce window or no update needed
                 new_deployment[layer] = self.current_deployment[layer]
                 new_deployed_replicas[layer] = self.current_deployed_replicas[layer]
                 new_average_to_peak_ratio[layer] = self.average_to_peak_history.get(layer, 0.0)
@@ -918,6 +934,7 @@ class FlashLB(EplbPolicy):
             window = max(length // self.sample_size, 1)
             data = data[-window * self.sample_size :].reshape((-1, window, *shape[1:])).sum(1)
             # Flash tree search for optimal deployment
+            recomputed = True
             flash_tree = FlashTree(data, num_replicas, num_devices, self.z_score, self.depth, self.width)
             best_deployment, best_replicas, best_score = flash_tree.optimize_balanceness()
 
@@ -937,6 +954,9 @@ class FlashLB(EplbPolicy):
             )
             delta_average_to_peak_ratio[layer] = new_average_to_peak_ratio[layer] - current_average_to_peak_ratio
             pars[layer] = best_score
+
+        if recomputed:
+            self._last_recompute_time = now
 
         # Select layers to update (sorted by improvement, positive delta only)
         priority_idx = np.argsort(-delta_average_to_peak_ratio)
